@@ -1,43 +1,92 @@
 import faiss
 import numpy as np
-from models.two_tower import MockTwoTowerModel, EMBEDDING_DIM
 
-class CandidateGenerator:
-    def __init__(self, num_items: int = 50000):
-        self.two_tower = MockTwoTowerModel()
-        self.num_items = num_items
-        self.index = faiss.IndexFlatIP(EMBEDDING_DIM) # Inner Product -> Cosine Similarity for normalized vectors
-        self.item_ids = list(range(1, num_items + 1))
+class VectorSearchIndex:
+    """
+    Handles Approximate Nearest Neighbor (ANN) search using FAISS.
+    
+    UPGRADE: 
+    Switched from `IndexFlatIP` (Exact Search, O(N)) which requires scanning every 
+    item in the catalog, to `IndexHNSWFlat` (Approximate Search, O(log N)).
+    HNSW builds a multi-layered graph where queries are routed through 
+    navigable small worlds, enabling blazing fast retrieval for millions of items.
+    """
+    def __init__(self, embedding_dim=128):
+        self.dim = embedding_dim
         
-        self._build_index()
+        # M is the number of neighbors connected to each node in the HNSW graph.
+        # Higher M = better recall, but more memory usage and slower insertion.
+        M = 32
+        
+        # HNSW index uses L2 distance by default. For inner product (cosine sim on normalized vectors),
+        # we can still use HNSW but need to be careful with distance interpretation (lower is closer).
+        # We'll stick to L2 for now since Two-Tower embeddings are L2 Normalized.
+        self.index = faiss.IndexHNSWFlat(self.dim, M, faiss.METRIC_L2)
+        
+        # efConstruction controls index building time vs accuracy
+        self.index.hnsw.efConstruction = 64
+        
+        # efSearch controls search time vs accuracy (higher = slower but more accurate recall)
+        self.index.hnsw.efSearch = 32
 
-    def _build_index(self):
-        print(f"Building FAISS index with {self.num_items} items...")
+        # IDMap allows us to store the actual string Item IDs, otherwise FAISS only
+        # cares about sequential integer indices (0, 1, 2...).
+        # We need to map string IDs to integer IDs externally for HNSW in Python,
+        # but for simplicity in this mock, we map integer IDs directly.
+        self.index_id_map = faiss.IndexIDMap(self.index)
         
-        # Batch generation for efficiency
-        batch_size = 10000
-        for i in range(0, self.num_items, batch_size):
-            batch_ids = self.item_ids[i:i + batch_size]
-            embeddings = self.two_tower.batch_item_embeddings(batch_ids)
-            self.index.add(embeddings)
+        self.item_ids = [] # To map FAISS int indices back to string Product IDs
+
+    def build_index(self, item_embeddings: dict):
+        """
+        Builds the HNSW graph index from a dictionary of {item_id: embedding_list}
+        """
+        if not item_embeddings:
+            return
+
+        print(f"Building FAISS HNSW Index for {len(item_embeddings)} items...")
+        
+        vectors = []
+        ids = []
+        
+        for idx, (item_id, emb) in enumerate(item_embeddings.items()):
+            vectors.append(emb)
+            ids.append(idx)
+            self.item_ids.append(item_id)
             
-        print("FAISS index built successfully.")
-
-    def get_candidates(self, user_id: int, top_k: int = 100) -> list[int]:
-        user_emb = self.two_tower.get_user_embedding(user_id)
-        # Reshape to (1, D)
-        query = np.expand_dims(user_emb, axis=0)
+        # Convert to float32 contiguous arrays required by FAISS
+        vector_matrix = np.array(vectors, dtype=np.float32)
+        id_array = np.array(ids, dtype=np.int64)
         
-        # Search index
-        distances, indices = self.index.search(query, top_k)
-        
-        # indices contains the row num in FAISS, which maps 1:1 to self.item_ids index
-        # (Assuming item_ids 1 to N were added sequentially)
-        candidate_item_ids = [self.item_ids[idx] for idx in indices[0]]
-        return candidate_item_ids
+        # HNSW requires vectors to be normalized if we want cosine similarity behavior from L2
+        faiss.normalize_L2(vector_matrix)
 
-if __name__ == "__main__":
-    generator = CandidateGenerator(num_items=10000)
-    user_id = 1938
-    candidates = generator.get_candidates(user_id, top_k=10)
-    print(f"Top 10 Candidate Items for User {user_id}: {candidates}")
+        self.index_id_map.add_with_ids(vector_matrix, id_array)
+        print("HNSW Index built successfully.")
+
+    def search(self, query_vector: list, top_k=100) -> list:
+        """
+        Retrieves the top_k Candidate items for a given User Query vector.
+        Runs in O(log N) time instead of O(N) linear scan.
+        """
+        if self.index_id_map.ntotal == 0:
+            return []
+
+        # Convert query to FAISS format
+        query_matrix = np.array([query_vector], dtype=np.float32)
+        faiss.normalize_L2(query_matrix)
+        
+        # Perform HNSW Search
+        # D = distances (L2 squared), I = integer IDs
+        D, I = self.index_id_map.search(query_matrix, top_k)
+        
+        # Map integer IDs back to actual string Item IDs
+        candidates = []
+        for int_id in I[0]:
+            if int_id != -1 and int_id < len(self.item_ids):
+                candidates.append(self.item_ids[int_id])
+                
+        return candidates
+
+# Instantiate a global Search Index for the API to utilize
+faiss_index = VectorSearchIndex()
