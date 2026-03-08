@@ -1,3 +1,5 @@
+import asyncio
+from functools import lru_cache
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List
@@ -8,18 +10,18 @@ from models.vector_search import faiss_index
 from models.ranking import xgb_ranker
 
 app = FastAPI(
-    title="Algofriend Universal Recommender API",
-    description="A production-grade two-stage recommendation engine using Two-Tower DNNs, FAISS HNSW, and XGBoost LTR.",
-    version="2.0.0"
+    title="Algofriend Universal Recommender API 🚀",
+    description="A production-grade two-stage recommendation engine using Two-Tower DNNs, FAISS HNSW, and XGBoost LTR. 🧠⚡",
+    version="2.1.0"
 )
 
 # -------------------------------------------------------------
 # Pydantic Schemas for Validation
 # -------------------------------------------------------------
 class RecommendRequest(BaseModel):
-    user_id: str = Field(..., description="Unique identifier for the user")
-    top_k: int = Field(10, ge=1, le=100, description="Number of final recommendations to return")
-    candidates_to_fetch: int = Field(100, ge=10, le=1000, description="Number of candidates to retrieve from FAISS before ranking")
+    user_id: str = Field(..., description="Unique identifier for the user 👤")
+    top_k: int = Field(10, ge=1, le=100, description="Number of final recommendations to return 🎯")
+    candidates_to_fetch: int = Field(100, ge=10, le=1000, description="Number of candidates to retrieve from FAISS before ranking 🔍")
 
 class RecommendationItem(BaseModel):
     item_id: str
@@ -31,17 +33,25 @@ class RecommendResponse(BaseModel):
 
 class IndexUpdateItem(BaseModel):
     item_id: str
-    text_content: str = Field(..., description="Text description/metadata of the item to be embedded")
+    text_content: str = Field(..., description="Text description/metadata of the item to be embedded 📝")
+
+# -------------------------------------------------------------
+# Memory Cache for extreme performance on hot queries 🔥
+# -------------------------------------------------------------
+@lru_cache(maxsize=1000)
+def get_cached_user_embedding(user_id: str):
+    """Caches the heavy neural network forward pass for active users."""
+    return two_tower_model.encode_user(user_id)
 
 # -------------------------------------------------------------
 # API Endpoints
 # -------------------------------------------------------------
 
-@app.get("/health")
+@app.get("/health", tags=["Monitoring 📊"])
 def health_check():
-    return {"status": "ok", "components": {"faiss_items": faiss_index.index_id_map.ntotal}}
+    return {"status": "ok ✅", "components": {"faiss_items": faiss_index.index_id_map.ntotal}}
 
-@app.post("/recommend", response_model=RecommendResponse)
+@app.post("/recommend", response_model=RecommendResponse, tags=["Inference 🏃‍♂️"])
 async def get_recommendations(request: RecommendRequest):
     """
     Two-Stage Recommendation Pipeline:
@@ -49,17 +59,20 @@ async def get_recommendations(request: RecommendRequest):
     2. Ranking: Score and sort candidates using XGBoost LTR model.
     """
     if faiss_index.index_id_map.ntotal == 0:
-        raise HTTPException(status_code=503, detail="Vector index is empty. Push items first.")
+        raise HTTPException(status_code=503, detail="Vector index is empty. Push items first! ⚠️")
 
     # STAGE 1: Retrieval (Deep Retrieval from Two-Tower model -> FAISS)
-    user_embedding = two_tower_model.encode_user(request.user_id)
+    user_embedding = get_cached_user_embedding(request.user_id)
     candidates = faiss_index.search(user_embedding, top_k=request.candidates_to_fetch)
     
     if not candidates:
         return RecommendResponse(user_id=request.user_id, recommendations=[])
 
     # STAGE 2: Ranking (Heavy cross-feature scoring via XGBoost)
-    ranked_results = xgb_ranker.rank_candidates(request.user_id, candidates)
+    # In a real async environment, we might run this CPU-bound task in a threadpool
+    ranked_results = await asyncio.to_thread(
+        xgb_ranker.rank_candidates, request.user_id, candidates
+    )
     
     # Trim to Final Top-K
     final_top_k = ranked_results[:request.top_k]
