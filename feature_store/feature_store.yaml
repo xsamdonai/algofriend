@@ -1,0 +1,13 @@
+project: algofriend_fs
+registry: data/registry.db
+provider: local
+offline_store:
+  type: postgres
+  host: localhost
+  port: 5432
+  database: feature_store
+  user: algofriend
+  password: algopassword
+online_store:
+  type: redis
+  connection_string: "localhost:6379"
